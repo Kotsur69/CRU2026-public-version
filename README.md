@@ -29,7 +29,7 @@ cd nextjs_space
 cp .env.example .env          # set DATABASE_URL, NEXTAUTH_SECRET, SEED_ADMIN_PASSWORD
 docker compose up -d          # or point DATABASE_URL at your own Postgres
 yarn install
-yarn prisma migrate deploy
+yarn db:deploy                # apply migrations
 yarn db:seed                  # dictionaries + admin user
 yarn dev                      # http://localhost:3100
 ```
