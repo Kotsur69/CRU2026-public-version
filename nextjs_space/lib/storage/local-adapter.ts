@@ -1,0 +1,180 @@
+import { promises as fs } from "fs";
+import { createHash } from "crypto";
+import path from "path";
+import { mimeFor } from "./mime";
+import type { StorageAdapter, StoredObject } from "./types";
+
+/** Katalog, do którego trafiają wgrywki — ten sam, w którym leży eksport z serwera legacy. */
+const UPLOAD_PREFIX = "attachments";
+
+/**
+ * Rozszerzenie z nazwy pliku od użytkownika. Nazwa jest niezaufana, a trafia do klucza
+ * storage, więc przepuszczamy wyłącznie krótki, alfanumeryczny sufiks — nic, co mogłoby
+ * nieść separator ścieżki albo drugą kropkę.
+ */
+function safeExtension(filename: string): string | null {
+  const raw = path.extname(filename).slice(1).toLowerCase();
+  return /^[a-z0-9]{1,8}$/.test(raw) ? raw : null;
+}
+
+// Adapter-stub symulujący fizyczny serwer plików (legacy) przez lokalny katalog.
+// Klucz = ścieżka względna wewnątrz STORAGE_LOCAL_ROOT. Do podmiany bez zmian w UI.
+
+/**
+ * Legacy stored `attachments/<md5>.<ext>`, but for a handful of uploads the extension
+ * written to disk was mangled (the original filename contained spaces or extra dots),
+ * so the DB key and the real filename disagree past the dot — e.g. the DB says
+ * `…5d3d.pdf` while disk holds `…5d3d.A`. The md5 stem is unique across the export
+ * (verified: 39 280 files, 39 280 distinct stems), so it is a safe fallback key.
+ */
+export class LocalStorageAdapter implements StorageAdapter {
+  private readonly root: string;
+  /** Lazily built per directory: md5 stem → actual filename. */
+  private readonly stemIndexes = new Map<string, Promise<Map<string, string>>>();
+
+  constructor(root: string) {
+    this.root = path.resolve(root);
+  }
+
+  private resolve(key: string): string {
+    // Zabezpieczenie przed path traversal poza root.
+    const full = path.resolve(this.root, key);
+    if (full !== this.root && !full.startsWith(this.root + path.sep)) {
+      throw new Error(`Niedozwolony klucz storage: ${key}`);
+    }
+    return full;
+  }
+
+  private stemIndex(dirKey: string): Promise<Map<string, string>> {
+    const cached = this.stemIndexes.get(dirKey);
+    if (cached) return cached;
+
+    const building = (async () => {
+      const index = new Map<string, string>();
+      let entries: string[];
+      try {
+        entries = await fs.readdir(this.resolve(dirKey));
+      } catch {
+        return index;
+      }
+      for (const name of entries) {
+        const stem = name.split(".")[0];
+        // A colliding stem would make the fallback ambiguous — keep the first and
+        // let the exact-match path handle the rest.
+        if (stem && !index.has(stem)) index.set(stem, name);
+      }
+      return index;
+    })();
+
+    this.stemIndexes.set(dirKey, building);
+    return building;
+  }
+
+  /** Absolute path of the file backing `key`, or null when nothing matches. */
+  private async locate(key: string): Promise<string | null> {
+    const exact = this.resolve(key);
+    try {
+      const s = await fs.stat(exact);
+      if (s.isFile()) return exact;
+      return null;
+    } catch {
+      // Fall through to the stem fallback below.
+    }
+
+    const dirKey = path.posix.dirname(key.split(path.sep).join("/"));
+    const stem = path.basename(key).split(".")[0];
+    if (!stem) return null;
+
+    const actual = (await this.stemIndex(dirKey === "." ? "" : dirKey)).get(stem);
+    if (!actual) return null;
+
+    const full = this.resolve(dirKey === "." ? actual : `${dirKey}/${actual}`);
+    try {
+      const s = await fs.stat(full);
+      return s.isFile() ? full : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async exists(key: string): Promise<boolean> {
+    return (await this.locate(key)) !== null;
+  }
+
+  async stat(key: string): Promise<StoredObject | null> {
+    const full = await this.locate(key);
+    if (!full) return null;
+    const s = await fs.stat(full);
+    // Name and type come from the KEY, not from the file on disk: where legacy mangled
+    // the extension the key still carries the true one (verified — every such file is a
+    // well-formed PDF), and reporting the mangled name would break inline preview.
+    const filename = path.basename(key);
+    return {
+      key,
+      filename,
+      sizeBytes: s.size,
+      mimeType: mimeFor(filename),
+      modifiedAt: s.mtime,
+    };
+  }
+
+  async list(prefix: string): Promise<StoredObject[]> {
+    const dir = this.resolve(prefix);
+    let entries: string[];
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      return [];
+    }
+    const out: StoredObject[] = [];
+    for (const name of entries) {
+      // Storage keys are always "/"-separated, whatever the host OS uses.
+      const stat = await this.stat(prefix ? `${prefix}/${name}` : name);
+      if (stat) out.push(stat);
+    }
+    return out;
+  }
+
+  async getBuffer(key: string): Promise<Buffer> {
+    const full = await this.locate(key);
+    if (!full) throw new Error(`Brak pliku w storage: ${key}`);
+    return fs.readFile(full);
+  }
+
+  async getDownloadUrl(key: string): Promise<string> {
+    // Adapter lokalny nie ma publicznego URL — pobieranie przez trasę proxy.
+    return `/api/files/${encodeURIComponent(key)}`;
+  }
+
+  /**
+   * Nowe pliki trafiają dokładnie tam, gdzie leży eksport z serwera legacy i pod tą samą
+   * konwencją `attachments/<md5>.<ext>`. Klucz z md5 TREŚCI daje przy okazji deduplikację
+   * — ta sama umowa wgrana dwa razy zajmuje jedno miejsce, a indeks rdzeni (patrz
+   * `stemIndex`) pozostaje jednoznaczny, bo md5 się nie powtarza.
+   */
+  async put(filename: string, data: Buffer): Promise<string> {
+    const digest = createHash("md5").update(data).digest("hex");
+    const ext = safeExtension(filename);
+    const key = ext ? `${UPLOAD_PREFIX}/${digest}.${ext}` : `${UPLOAD_PREFIX}/${digest}`;
+
+    const full = this.resolve(key);
+    try {
+      // Ta sama treść jest już w magazynie — nie duplikujemy bajtów.
+      if ((await fs.stat(full)).isFile()) return key;
+    } catch {
+      // Brak pliku: zapisujemy poniżej.
+    }
+
+    await fs.mkdir(path.dirname(full), { recursive: true });
+    await fs.writeFile(full, data);
+    this.stemIndexes.delete(UPLOAD_PREFIX);
+    return key;
+  }
+
+  async remove(key: string): Promise<void> {
+    const full = await this.locate(key);
+    if (!full) return;
+    await fs.unlink(full);
+    this.stemIndexes.delete(path.posix.dirname(key));
+  }
+}
